@@ -52,7 +52,7 @@ def main():
     option = get_option()
     helper.run(option)
     option.call_all_plugin('after_download')
-    download_album('123', extra=Feature.export_pdf)
+    download_album('123', option, extra=Feature.export_pdf)
 
 def get_option():
     # 读取 option 配置文件
