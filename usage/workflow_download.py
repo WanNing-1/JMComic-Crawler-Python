@@ -1,12 +1,9 @@
 from jmcomic import *
 from jmcomic.cl import JmcomicUI
-from jmcomic import download_album, Feature
-
-download_album('1441962', extra=Feature.export_pdf)
 
 # 下方填入你要下载的本子的id，一行一个，每行的首尾可以有空白字符
 jm_albums = '''
-JM1441962
+
 
 
 '''
