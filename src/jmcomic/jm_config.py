@@ -1,4 +1,8 @@
+import logging
+
 from common import time_stamp, field_cache, ProxyBuilder
+
+jm_logger = logging.getLogger('jmcomic')
 
 
 def shuffled(lines):
@@ -9,9 +13,27 @@ def shuffled(lines):
     return ls
 
 
-def default_jm_logging(topic: str, msg: str):
-    from common import format_ts, current_thread
-    print('[{}] [{}]:【{}】{}'.format(format_ts(), current_thread().name, topic, msg))
+def setup_default_jm_logger():
+    # 为了保持原有默认向下兼容，如果没有 handler，我们加一个控制台 handler
+    if not jm_logger.handlers:
+        import sys
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter('[%(asctime)s] [%(threadName)s]:【%(topic)s】%(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        handler.setFormatter(formatter)
+        jm_logger.addHandler(handler)
+        jm_logger.setLevel(logging.INFO)
+
+
+def default_jm_logging(topic: str, msg, e: Exception = None):
+    # 支持 jm_log('topic', e) 的简写
+    if isinstance(msg, BaseException):
+        e = msg
+        msg = str(msg)
+    extra = {'topic': topic}
+    if e is not None:
+        jm_logger.error(msg, extra=extra, exc_info=e)
+    else:
+        jm_logger.info(msg, extra=extra)
 
 
 # 禁漫常量
@@ -21,6 +43,9 @@ class JmMagicConstants:
     ORDER_BY_VIEW = 'mv'
     ORDER_BY_PICTURE = 'mp'
     ORDER_BY_LIKE = 'tf'
+    # 下面这两个目前只在网页上看到，app上没有
+    ORDER_BY_SCORE = 'tr'
+    ORDER_BY_COMMENT = 'md'
 
     ORDER_MONTH_RANKING = 'mv_m'
     ORDER_WEEK_RANKING = 'mv_w'
@@ -76,7 +101,8 @@ class JmMagicConstants:
     APP_TOKEN_SECRET = '18comicAPP'
     APP_TOKEN_SECRET_2 = '18comicAPPContent'
     APP_DATA_SECRET = '185Hcomic3PAPP7R'
-    APP_VERSION = '1.7.9'
+    API_DOMAIN_SERVER_SECRET = 'diosfjckwpqpdfjkvnqQjsik'
+    APP_VERSION = '2.0.21'
 
 
 # 模块级别共用配置
@@ -84,7 +110,7 @@ class JmModuleConfig:
     # 网站相关
     PROT = "https://"
     JM_REDIRECT_URL = f'{PROT}jm365.work/3YeBdF'  # 永久網域，怕走失的小伙伴收藏起来
-    JM_PUB_URL = f'{PROT}jmcomic-fb.vip'
+    JM_PUB_URL = f'{PROT}jmcomicgo.org'
     JM_CDN_IMAGE_URL_TEMPLATE = PROT + 'cdn-msp.{domain}/media/photos/{photo_id}/{index:05}{suffix}'  # index 从1开始
     JM_IMAGE_SUFFIX = ['.jpg', '.webp', '.png', '.gif']
 
@@ -127,10 +153,19 @@ class JmModuleConfig:
 
     # 移动端API域名
     DOMAIN_API_LIST = shuffled('''
-    www.cdnmhwscc.vip
-    www.cdnblackmyth.club
-    www.cdnmhws.cc
-    www.cdnuc.vip
+    www.cdnhjk.net
+    www.cdngwc.cc
+    www.cdngwc.net
+    www.cdngwc.club
+    www.cdnhjk.cc
+    ''')
+
+    DOMAIN_API_UPDATED_LIST = None
+
+    # 获取最新移动端API域名的地址
+    API_URL_DOMAIN_SERVER_LIST = shuffled('''
+    https://rup4a04-c01.tos-ap-southeast-1.bytepluses.com/newsvr-2025.txt
+    https://rup4a04-c02.tos-cn-hongkong.bytepluses.com/newsvr-2025.txt
     ''')
 
     APP_HEADERS_TEMPLATE = {
@@ -141,7 +176,7 @@ class JmModuleConfig:
 
     APP_HEADERS_IMAGE = {
         'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-        'X-Requested-With': 'com.jiaohua_browser',
+        'X-Requested-With': 'com.JMComic3.app',
         'Referer': PROT + DOMAIN_API_LIST[0],
         'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
     }
@@ -200,6 +235,8 @@ class JmModuleConfig:
     FLAG_USE_FIX_TIMESTAMP = True
     # 移动端Client初始化cookies
     FLAG_API_CLIENT_REQUIRE_COOKIES = True
+    # 自动更新禁漫API域名
+    FLAG_API_CLIENT_AUTO_UPDATE_DOMAIN = True
     # log开关标记
     FLAG_ENABLE_JM_LOG = True
     # log时解码url
@@ -368,11 +405,29 @@ class JmModuleConfig:
         token, tokenparam = JmCryptoTool.token_and_tokenparam(ts)
         return ts, token, tokenparam
 
-    # noinspection PyUnusedLocal
     @classmethod
-    def jm_log(cls, topic: str, msg: str):
-        if cls.FLAG_ENABLE_JM_LOG is True:
-            cls.EXECUTOR_LOG(topic, msg)
+    def jm_log(cls, topic: str, msg, e: Exception = None):
+        if cls.FLAG_ENABLE_JM_LOG:
+            executor = cls.EXECUTOR_LOG
+            if e is None:
+                executor(topic, msg)
+            else:
+                import inspect
+                try:
+                    sig = inspect.signature(executor)
+                    params_count = len(sig.parameters)
+                except (ValueError, TypeError):
+                    params_count = 2
+
+                if params_count >= 3:
+                    executor(topic, msg, e)
+                else:
+                    import warnings
+                    warnings.warn(
+                        'jmcomic已升级到标准logging，建议将EXECUTOR_LOG重新定义为3个参数以接收异常对象 (topic, msg, e)',
+                        stacklevel=2
+                    )
+                    executor(topic, msg)
 
     @classmethod
     def disable_jm_log(cls):
@@ -380,13 +435,13 @@ class JmModuleConfig:
 
     @classmethod
     def new_postman(cls, session=False, **kwargs):
-        kwargs.setdefault('impersonate', 'chrome110')
+        kwargs.setdefault('impersonate', 'chrome')
         kwargs.setdefault('headers', JmModuleConfig.new_html_headers())
         kwargs.setdefault('proxies', JmModuleConfig.DEFAULT_PROXIES)
 
         from common import Postmans
 
-        if session is True:
+        if session:
             return Postmans.new_session(**kwargs)
 
         return Postmans.new_postman(**kwargs)
@@ -401,7 +456,7 @@ class JmModuleConfig:
 
     DEFAULT_OPTION_DICT: dict = {
         'log': None,
-        'dir_rule': {'rule': 'Bd_Pname', 'base_dir': None},
+        'dir_rule': {'rule': 'Bd_Pname', 'base_dir': None, 'normalize_zh': None},
         'download': {
             'cache': True,
             'image': {'decode': True, 'suffix': None},
@@ -416,7 +471,7 @@ class JmModuleConfig:
             'postman': {
                 'type': 'curl_cffi',
                 'meta_data': {
-                    'impersonate': 'chrome110',
+                    'impersonate': 'chrome',
                     'headers': None,
                     'proxies': None,
                 }
@@ -493,5 +548,63 @@ class JmModuleConfig:
         cls.REGISTRY_EXCEPTION_LISTENER[etype] = listener
 
 
+setup_default_jm_logger()
+
 jm_log = JmModuleConfig.jm_log
 disable_jm_log = JmModuleConfig.disable_jm_log
+
+
+class PrettyFormatter(logging.Formatter):
+    """带 ANSI 颜色的日志格式化器，按 topic 前缀分配颜色"""
+
+    TOPIC_COLORS = {
+        'album':  '\033[1;36m',  # 青色加粗 — 本子级别
+        'photo':  '\033[36m',    # 青色 — 章节级别
+        'image':  '\033[2;37m',  # 暗灰 — 图片级别（弱化）
+        'plugin': '\033[35m',    # 紫色 — 插件
+        'req':    '\033[33m',    # 黄色 — 网络请求
+        'api':    '\033[34m',    # 蓝色 — API
+    }
+    ERROR_COLOR = '\033[1;31m'   # 红色加粗
+    WARN_COLOR = '\033[33m'      # 黄色
+    RESET = '\033[0m'
+
+    def __init__(self):
+        super().__init__(fmt='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
+
+    def format(self, record):
+        topic = getattr(record, 'topic', '')
+        if record.levelno >= logging.ERROR:
+            color = self.ERROR_COLOR
+        elif record.levelno >= logging.WARNING:
+            color = self.WARN_COLOR
+        else:
+            # 按 topic 前缀匹配颜色
+            color = next(
+                (c for prefix, c in self.TOPIC_COLORS.items()
+                 if topic.startswith(prefix)),
+                ''
+            )
+        formatted = super().format(record)
+        return f'{color}{formatted}{self.RESET}' if color else formatted
+
+
+def enable_pretty_log():
+    """开启带颜色的美化日志"""
+    import sys
+
+    # Windows 需要启用 VT100 ANSI 支持
+    if sys.platform == 'win32':
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+    jm_logger.handlers.clear()
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(PrettyFormatter())
+    jm_logger.addHandler(handler)
+    jm_logger.setLevel(logging.INFO)
+

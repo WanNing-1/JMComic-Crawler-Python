@@ -11,6 +11,7 @@ class Downloadable:
         self.save_path: str = ''
         self.exists: bool = False
         self.skip = False
+        self.cache = True
 
 
 class JmBaseEntity:
@@ -125,16 +126,22 @@ class DetailEntity(JmBaseEntity, IndexedEntity):
         return f'[{self.id}] {self.oname}'
 
     def __str__(self):
-        return f'''{self.__class__.__name__}({self.__alias__()}-{self.id}: "{self.title}")'''
+        return f'''{self.__class__.__name__}({self.alias_en()}-{self.id}: "{self.title}")'''
 
     __repr__ = __str__
 
     @classmethod
-    def __alias__(cls):
+    def alias_en(cls):
         # "JmAlbumDetail" -> "album" (本子)
         # "JmPhotoDetail" -> "photo" (章节)
         cls_name = cls.__name__
         return cls_name[cls_name.index("m") + 1: cls_name.rfind("Detail")].lower()
+
+    @classmethod
+    def alias_cn(cls) -> str:
+        # "JmAlbumDetail" -> "album" (本子)
+        # "JmPhotoDetail" -> "photo" (章节)
+        return "本子" if issubclass(cls, JmAlbumDetail) else "章节"
 
     @classmethod
     def get_dirname(cls, detail: 'DetailEntity', ref: str) -> str:
@@ -469,11 +476,13 @@ class JmAlbumDetail(DetailEntity, Downloadable):
                  authors,
                  tags,
                  related_list=None,
+                 description='',
                  ):
         super().__init__()
         self.album_id: str = str(album_id)
         self.scramble_id: str = str(scramble_id)
         self.name: str = str(name).strip()
+        self.description = str(description).strip()
         self.page_count: int = int(page_count)  # 总页数
         self.pub_date: str = pub_date  # 发布日期
         self.update_date: str = update_date  # 更新日期

@@ -60,22 +60,28 @@ class CacheRegistry:
 class DirRule:
     RULE_BASE_DIR = 'Bd'
 
-    def __init__(self, rule: str, base_dir=None):
+    def __init__(self, rule: str, base_dir=None, normalize_zh=None):
+        """
+        :param rule: DSL rule
+        :param base_dir: base directory
+        :param normalize_zh: 'zh-cn'|'zh-tw'| or None. 控制是否以及如何进行繁简体归一化，默认 None
+        """
         base_dir = JmcomicText.parse_to_abspath(base_dir)
         self.base_dir = base_dir
         self.rule_dsl = rule
+        self.normalize_zh = normalize_zh
         self.parser_list: List[Tuple[str, Callable]] = self.get_rule_parser_list(rule)
 
     def decide_image_save_dir(self,
                               album: JmAlbumDetail,
                               photo: JmPhotoDetail,
                               ) -> str:
-        return self._build_path_from_rules(album, photo)
+        return self.apply_rule_to_path(album, photo)
 
     def decide_album_root_dir(self, album: JmAlbumDetail) -> str:
-        return self._build_path_from_rules(album, None, True)
+        return self.apply_rule_to_path(album, None, True)
 
-    def _build_path_from_rules(self, album, photo, only_album_rules=False) -> str:
+    def apply_rule_to_path(self, album, photo, only_album_rules=False) -> str:
         path_ls = []
         for rule, parser in self.parser_list:
             if only_album_rules and not (rule == self.RULE_BASE_DIR or rule.startswith('A')):
@@ -85,14 +91,16 @@ class DirRule:
                 path = parser(album, photo, rule)
             except BaseException as e:
                 # noinspection PyUnboundLocalVariable
-                jm_log('dir_rule', f'路径规则"{rule}"的解析出错: {e}, album={album}, photo={photo}')
+                jm_log('dir_rule', f'路径规则"{rule}"的解析出错: {e}, album={album}, photo={photo}', e)
                 raise e
             if parser != self.parse_bd_rule:
-                path = fix_windir_name(str(path)).strip()
+                # 根据配置 normalize_zh 进行繁简体统一
+                conv_path = JmcomicText.to_zh(str(path), self.normalize_zh)
+                path = fix_windir_name(conv_path).strip()
 
             path_ls.append(path)
 
-        return fix_filepath('/'.join(path_ls), is_dir=True)
+        return fix_filepath('/'.join(path_ls))
 
     def get_rule_parser_list(self, rule_dsl: str):
         """
@@ -103,7 +111,6 @@ class DirRule:
         parser_list: list = []
 
         for rule in rule_list:
-            rule = rule.strip()
             if rule == self.RULE_BASE_DIR:
                 parser_list.append((rule, self.parse_bd_rule))
                 continue
@@ -123,9 +130,9 @@ class DirRule:
     @classmethod
     def parse_f_string_rule(cls, album, photo, rule: str):
         properties = {}
-        if album:
+        if album is not None:
             properties.update(album.get_properties_dict())
-        if photo:
+        if photo is not None:
             properties.update(photo.get_properties_dict())
         return rule.format(**properties)
 
@@ -135,17 +142,21 @@ class DirRule:
         return str(DetailEntity.get_dirname(detail, rule[1:]))
 
     # noinspection PyMethodMayBeStatic
-    def split_rule_dsl(self, rule_dsl: str):
-        if rule_dsl == self.RULE_BASE_DIR:
-            return [rule_dsl]
-
+    def split_rule_dsl(self, rule_dsl: str) -> List[str]:
         if '/' in rule_dsl:
-            return rule_dsl.split('/')
+            rule_list = rule_dsl.split('/')
+        elif '_' in rule_dsl:
+            rule_list = rule_dsl.split('_')
+        else:
+            rule_list = [rule_dsl]
 
-        if '_' in rule_dsl:
-            return rule_dsl.split('_')
+        for i, e in enumerate(rule_list):
+            rule_list[i] = e.strip()
 
-        ExceptionTool.raises(f'不支持的rule配置: "{rule_dsl}"')
+        if rule_list[0] != self.RULE_BASE_DIR:
+            rule_list.insert(0, self.RULE_BASE_DIR)
+
+        return rule_list
 
     @classmethod
     def get_rule_parser(cls, rule: str):
@@ -155,10 +166,11 @@ class DirRule:
         if rule.startswith(('A', 'P')):
             return cls.parse_detail_rule
 
-        ExceptionTool.raises(f'不支持的rule配置: "{rule}"')
+        return cls.parse_f_string_rule
+        # ExceptionTool.raises(f'不支持的rule配置: "{rule}"')
 
     @classmethod
-    def apply_rule_directly(cls, album, photo, rule: str) -> str:
+    def apply_rule_to_filename(cls, album, photo, rule: str) -> str:
         if album is None:
             album = photo.from_album
         # noinspection PyArgumentList
@@ -197,6 +209,7 @@ class JmOption:
             dir_rule={
                 'rule': self.dir_rule.rule_dsl,
                 'base_dir': self.dir_rule.base_dir,
+                'normalize_zh': self.dir_rule.normalize_zh,
             },
             download=self.download.src_dict,
             client=self.client.src_dict,
@@ -236,7 +249,7 @@ class JmOption:
         # 非动图，以配置为先
         return self.download.image.suffix or image.img_file_suffix
 
-    def decide_image_save_dir(self, photo, ensure_exists=True) -> str:
+    def decide_image_save_dir(self, photo: JmPhotoDetail, ensure_exists=True) -> str:
         # 使用 self.dir_rule 决定 save_dir
         save_dir = self.dir_rule.decide_image_save_dir(
             photo.from_album,
@@ -287,6 +300,8 @@ class JmOption:
         log = dic.pop('log', True)
         if log is False:
             disable_jm_log()
+        elif log == 'pretty':
+            enable_pretty_log()
 
         # version
         version = dic.pop('version', None)
@@ -315,6 +330,78 @@ class JmOption:
         if 'plugin' in dic:
             dic['plugins'] = dic.pop('plugin')
 
+        # 3: zip 插件 level 参数迁移
+        # level 已废弃，打包粒度由所在钩子上下文自动推导
+        plugins = dic.get('plugins', {})
+        if isinstance(plugins, dict):
+            cls._migrate_zip_level(plugins)
+
+    @classmethod
+    def _migrate_zip_level(cls, plugins: dict):
+        """
+        zip 插件 level 参数迁移。
+
+        level 已废弃，打包粒度由所在钩子的上下文自动推导。
+        迁移规则：level='album' → 确保在 after_album；其他 → 确保在 after_photo。
+        """
+
+        def log_advice(reason, plugins):
+            import yaml
+            # 意图聚焦：建议配置中只展示相关的 zip 插件，剔除其他无关插件的干扰
+            advice_plugins = {}
+            for g, plist in plugins.items():
+                zips = [p for p in plist if p.get('plugin') == 'zip']
+                if zips:
+                    advice_plugins[g] = zips
+
+            if not advice_plugins:
+                return
+
+            plugins_yml = yaml.dump({'plugins': advice_plugins}, default_flow_style=False, indent=2, sort_keys=False).strip()
+
+            jm_log('option.migrate',
+                   f'[zip 插件迁移] level 参数已过时，建议直接删除。'
+                   f'{reason}，建议参考如下的等价新写法：\n'
+                   f'```yml\n'
+                   f'{plugins_yml}\n'
+                   f'```'
+                   )
+
+        for group in ['after_album', 'after_photo']:
+            plugin_list = plugins.get(group)
+            if not isinstance(plugin_list, list):
+                continue
+            i = 0
+            while i < len(plugin_list):
+                pinfo = plugin_list[i]
+                if pinfo.get('plugin') != 'zip':
+                    i += 1
+                    continue
+                kwargs = pinfo.get('kwargs') or {}
+                if 'level' not in kwargs:
+                    # 旧版本默认值是 'photo'
+                    level = 'photo'
+                else:
+                    level = kwargs.pop('level')
+
+                if group == 'after_album' and level != 'album':
+                    # after_album + level=photo → 等价迁移到 after_photo
+                    plugins.setdefault('after_photo', []).append(pinfo)
+                    plugin_list.pop(i)
+                    log_advice('你的当前配置为：在本子下载完毕后按章节压缩', plugins)
+
+                elif group == 'after_photo' and level == 'album':
+                    # after_photo + level=album → 等价迁移到 after_album
+                    plugins.setdefault('after_album', []).append(pinfo)
+                    plugin_list.pop(i)
+                    log_advice('你的当前配置为：在单章节下载完毕后对全本进行压缩', plugins)
+
+                else:
+                    if level != 'photo':
+                        jm_log('option.migrate',
+                               '[zip 插件迁移] level 参数已过时，你可以直接删除该参数，不会有任何影响')
+                    i += 1
+
     def deconstruct(self) -> Dict:
         return {
             'version': JmModuleConfig.JM_OPTION_VER,
@@ -322,6 +409,7 @@ class JmOption:
             'dir_rule': {
                 'rule': self.dir_rule.rule_dsl,
                 'base_dir': self.dir_rule.base_dir,
+                'normalize_zh': self.dir_rule.normalize_zh,
             },
             'download': self.download.src_dict,
             'client': self.client.src_dict,
@@ -359,7 +447,13 @@ class JmOption:
         """
         return self.new_jm_client(**kwargs)
 
-    def new_jm_client(self, domain_list=None, impl=None, cache=None, **kwargs) -> Union[JmHtmlClient, JmApiClient]:
+    def new_jm_client(self,
+                      domain_list=None,
+                      impl=None,
+                      cache=None,
+                      domain_retry_strategy=None,
+                      **kwargs
+                      ) -> Union[JmHtmlClient, JmApiClient]:
         """
         创建新的Client（客户端），不同Client之间的元数据不共享
         """
@@ -416,10 +510,11 @@ class JmOption:
         if clazz == AbstractJmClient or not issubclass(clazz, AbstractJmClient):
             raise NotImplementedError(clazz)
 
-        client: AbstractJmClient = clazz(
+        client: JmcomicClient = clazz(
             postman=postman,
             domain_list=decide_domain_list(),
             retry_times=retry_times,
+            domain_retry_strategy=domain_retry_strategy,
         )
 
         # enable cache
@@ -485,23 +580,23 @@ class JmOption:
 
     def download_album(self,
                        album_id,
-                       downloader=None,
-                       callback=None,
+                       *args,
+                       **kwargs,
                        ):
         from .api import download_album
-        download_album(album_id, self, downloader, callback)
+        return download_album(album_id, self, *args, **kwargs)
 
     def download_photo(self,
                        photo_id,
-                       downloader=None,
-                       callback=None
+                       *args,
+                       **kwargs,
                        ):
         from .api import download_photo
-        download_photo(photo_id, self, downloader, callback)
+        return download_photo(photo_id, self, *args, **kwargs)
 
     # 下面的方法为调用插件提供支持
 
-    def call_all_plugin(self, group: str, safe=True, **extra):
+    def call_all_plugin(self, group: str, safe=None, **extra):
         plugin_list: List[dict] = self.plugins.get(group, [])
         if plugin_list is None or len(plugin_list) == 0:
             return
@@ -519,14 +614,14 @@ class JmOption:
             try:
                 self.invoke_plugin(pclass, kwargs, extra, pinfo)
             except BaseException as e:
-                if safe is True:
-                    traceback_print_exec()
+                if safe is True or pinfo.get('safe', True):
+                    jm_log('plugin.exception', e)
                 else:
                     raise e
 
     def invoke_plugin(self, pclass, kwargs: Optional[Dict], extra: dict, pinfo: dict):
         # 检查插件的参数类型
-        kwargs = self.fix_kwargs(kwargs)
+        kwargs: dict = self.fix_kwargs(kwargs)
         # 把插件的配置数据kwargs和附加数据extra合并，extra会覆盖kwargs
         if len(extra) != 0:
             kwargs.update(extra)
@@ -589,13 +684,13 @@ class JmOption:
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def handle_plugin_unexpected_error(self, e, pinfo: dict, kwargs: dict, _plugin, pclass):
         msg = str(e)
-        jm_log('plugin.error', f'插件 [{pclass.plugin_key}]，运行遇到未捕获异常，异常信息: [{msg}]')
+        jm_log('plugin.error', f'插件 [{pclass.plugin_key}]，运行遇到未捕获异常，异常信息: [{msg}]', e)
         raise e
 
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def handle_plugin_jmcomic_exception(self, e, pinfo: dict, kwargs: dict, _plugin, pclass):
         msg = str(e)
-        jm_log('plugin.exception', f'插件 [{pclass.plugin_key}] 调用失败，异常信息: [{msg}]')
+        jm_log('plugin.exception', f'插件 [{pclass.plugin_key}] 调用失败，异常信息: [{msg}]', e)
         raise e
 
     # noinspection PyMethodMayBeStatic
